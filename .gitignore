@@ -1,0 +1,12 @@
+*.env
+*.env.secret
+*.env.shared
+
+*.log
+*.DS_STORE
+
+.venv/
+
+__pycache__/
+*.py[cod]
+*$py.class
