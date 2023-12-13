@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from dataclasses import dataclass
 from discord.ext import commands
 from datetime import datetime
-from contextlib import contextmanager
+import os
 import sys
 import asyncio
 import discord
@@ -13,10 +13,15 @@ import logging
 import logging.handlers
 import subprocess
 import argparse
+import regex as re
+import threading as thr
 
 
 class EnvMixedIn(BaseModel):
     DISCORD_FULCRUMBOT_CHANNELID: int
+    DOCKER_DAEMON_MAXCHECKS: int
+    DOCKER_DAEMON_POLLTIME: float
+    MCSERVER_TMP_VOLUME_LOCATION: Path
 
 
 @dataclass
@@ -49,10 +54,30 @@ PARSER = argparse.ArgumentParser(
     prog='FulcrumBot',
     description='https://discord.com/developers/applications/1183755813261680701/information'
 )
+
+CONTAINER_REG = re.compile(r'^(\d+\.){2}\d+')
+
+
+def ver_type(arg_value) -> str:
+    if not CONTAINER_REG.match(arg_value):
+        raise argparse.ArgumentTypeError(f'Must be formatted as the version number stripped of \'.\' if container name is $(versionstamp)-mc-$(digit)')
+    return arg_value.replace('.', '')
+
+
+PARSER.add_argument(
+    'ver',
+    type=ver_type,
+    help='The version number of the server to target. I.e. if there is a docker container running 1.19.3 as per the project-structure docs then "1.19.3"'
+)
 PARSER.add_argument(
     '-d', 
     action='store_true',
     help='Enable dev. mode'
+)
+PARSER.add_argument(
+    '-ldd', 
+    action='store_true',
+    help='Launch docker daemon. Use this option to attempt a launch of the docker daemon specified in env.shared'
 )
 PARSER.add_argument(
     '-lco',
@@ -69,6 +94,13 @@ PARSER.add_argument(
 )
 PARSED = PARSER.parse_args()
 
+if PARSED.ldd and os.name != 'nt':
+    logging.warning('The docker daemon could not start')
+    raise argparse.ArgumentTypeError('No host system support for -ldd opt (NT builds only)') from\
+        NotImplementedError('Non-fatal: -ldd tag is not compatible with anything but windows currently. Please ensure the daemon is running manually.')
+
+
+LOGGER = logging.getLogger('discord')
 
 CONFIG = {
     **dotenv_values(Path('./.env.secret')),
@@ -103,38 +135,110 @@ class BotClient(commands.Bot):
 class BotHandler(commands.Cog):
 
     _threshold_between_restarts = BOT_SETTINGS['server']['restart_threshold']
+    _PSNAME_REG = re.compile(r'(?:NAMES\n)(\d+-mc-\d+\n*)')
+    _CONTAINER_SUBVER_REG = re.compile(r'(\d+)$')
+    _USR_ARGS_REG = re.compile(r'^(?:--|-){1}[a-z]((?:[a-z])|(?:-)(?!-))+')
+    _COOLDOWN_MSG_REG = re.compile(r'(\d+\.\d+s)')
 
     def __init__(self, client):
         self._client = client
         self._session = Session()
+        if PARSED.ldd:
+            self._daemon_checked=False
     
-    @contextmanager
+    
     @staticmethod
-    def _dockerps():
-        try:
-            yield subprocess.check_output('docker ps', shell=True)
-        except subprocess.CalledProcessError as err:
-            logging.error('Docker ps failed. Probably because the docker daemon isn\'t running')
-            sys.excepthook = excepthook
-            raise RuntimeError('Failed to find a docker process to inject') from err
+    def catchSubProcess(log_msg, err_msg, stack_trace_off=False):
+        def outer_wrapper(func):
+            async def wrapper(*args, **kwargs):
+                try:
+                    return await func(*args, **kwargs)
+                except subprocess.CalledProcessError as err:
+                    logging.error(log_msg)
+                    if stack_trace_off:
+                        sys.excepthook = excepthook
+                    # If the program should exit gracefully
+                    # sys.exit(1)
+                    raise RuntimeError(err_msg) from err
+            return wrapper
+        return outer_wrapper
     
-    def _parse_dockerps(self):
-        with BotHandler._dockerps() as dps:
-            pass
+    @catchSubProcess('Docker ps failed. Probably because the docker daemon isn\'t running',
+                     'Failed to find a docker process to inject', 
+                     True)
+    async def _dockerps(self):
+        cmd = f'docker ps -a -f "NAME={PARSED.ver}-mc-\d+" --format "table {{{{.Names}}}}"'
+        if PARSED.ldd and not self._daemon_checked:
+            logging.warning('Attempting to force load the Docker Daemon. This is not a reliable process and relies on the Daemon self-reporting as a process')
+            subprocess.Popen(['cmd','/c', CONFIG['DOCKER_DESKTOP_EXEC']])
+            check = subprocess.run(cmd, shell=True, capture_output=True)
+            n_checks = 0
+            while check.returncode != 0 and n_checks < CONFIG['DOCKER_DAEMON_MAXCHECKS']:
+                logging.info(f'{n_checks}: Polling the docker daemon...')
+                await asyncio.sleep(CONFIG['DOCKER_DAEMON_POLLTIME'])
+                check = subprocess.run(cmd, shell=True, capture_output=True)
+                n_checks += 1
+            if n_checks == CONFIG['DOCKER_DAEMON_MAXCHECKS']:
+                raise subprocess.CalledProcessError('Couldn\'t force the docker daemon to load')
+            self._daemon_checked = True
+            return check.stdout.decode('ascii')
+        else:
+            return subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL).decode('ascii')
+        
     
-    def _run_docker_target(self):
-        pass
+    async def _parse_dockerps(self) -> str:
+        raw = await self._dockerps()
+        valid_vers = re.findall(BotHandler._PSNAME_REG, raw)
+        max_subver = (float('-infinity'), None)
+        for i, v in enumerate(valid_vers):
+            valid_vers[i] = valid_vers[i].strip()
+            subver = int(re.search(BotHandler._CONTAINER_SUBVER_REG, v).group(0))
+            max_subver = max(max_subver, (subver, i))
+        return valid_vers[max_subver[1]]
+    
+    @catchSubProcess('Failure to launch the docker target',
+                     'Failure to launch the docker target container. The daemon probably failed some time after parsing began')
+    async def _run_docker_target(self, tmp_session=False):
+        container_id = await self._parse_dockerps()
+        if tmp_session:
+            tmp_dir = CONFIG["MCSERVER_TMP_VOLUME_LOCATION"].joinpath('tmp')
+            list_dir = os.listdir(tmp_dir)
+            max_dir = float('-infinity') if list_dir else 0
+            for fn in os.listdir(tmp_dir):
+                max_dir = max(max_dir, int(re.search(BotHandler._CONTAINER_SUBVER_REG, fn).group(0)))
+            tmp_mount = tmp_dir.joinpath(f'tmp-mc-{max_dir + 1}')
+            os.mkdir(tmp_mount)
+            child = subprocess.Popen(
+                                    f'docker run -d -it -p 25565:25565 -e EULA=TRUE -v "{tmp_mount}":/data itzg/minecraft-server',
+                                    stdout=subprocess.PIPE
+                                    )
+        else:
+            child = subprocess.Popen(
+                                    f'docker start {container_id}',
+                                    stdout=subprocess.PIPE
+                                    )
+        # TODO: 
+        # (I) Start the listener thread that pipes input, stdout between the discord and the spawned shell
+        # (II) Whitelist certain commands
+        # (III) Add more options
 
-    
-    async def _spawn_server_session(self, ctx):
+    async def _spawn_server_session(self, ctx, *args):
+        opts = {}
+        for a in args:
+            match a:
+                case '--tmp':
+                    opts['tmp_session'] = True
+                case _:
+                    # Unrecognised command
+                    pass
+
         if ctx.message.created_at.timestamp() - self._session.start < \
             BotHandler._threshold_between_restarts:
-            self._run_docker_target()
             self._session.active = False
             await ctx.send(f'A session is already currently running!')
             return
         
-        self._run_docker_target()
+        await self._run_docker_target(**opts)
         
         self._session.active = True
         self._session.start = ctx.message.created_at.timestamp()
@@ -156,16 +260,56 @@ class BotHandler(commands.Cog):
             )
         )
     
-    @commands.hybrid_command()
+    @staticmethod
+    def _validate_usr_args(*args) -> str | None:
+        if not args:
+            return
+        args = list(args)
+        start = 0
+        for i, a in enumerate(args):
+            if not re.match(BotHandler._USR_ARGS_REG, a):
+                underline_err = ' ' * start + '^' * len(a)
+                # Remove formatting
+                err_wrd = '**__' + args[i].replace('*', '\*').replace('~', '\~').replace('_', '\_') + '__**'
+                # Do lookup here on the arg to give specific command info
+                return (
+                            '**ERROR:** *Invalid command string (!help for more)* Error occured while parsing the following word: '
+                            f'{err_wrd}'
+                            '```'
+                            f'{" ".join(args)}\n'
+                            f'{underline_err}'
+                            '```'
+                        )
+            start += len(a) + 1
+        return
+    
+    @commands.command()
     @commands.cooldown(1, 10, commands.BucketType.user)
-    async def start(self, ctx):
-        await self._spawn_server_session(ctx)
+    async def start(self, ctx, *args):
+        err = BotHandler._validate_usr_args(*args)
+        if err:
+            await ctx.reply(err)
+            return 1
+        await self._spawn_server_session(ctx, *args)
+        return 0
+
+    @commands.Cog.listener()
+    async def on_command_error(self, ctx, err, *_):
+        if isinstance(err, discord.ext.commands.errors.CommandOnCooldown):
+            t_left = re.search(BotHandler._COOLDOWN_MSG_REG, str(err)).group()
+            await ctx.reply(
+                            'Woah... Don\'t smack that double penjamin too fast\n\n'
+                            '**ERROR:** *Timeout exception* You\'re issuing commands too fast.'
+                            '```'
+                             f'You have a time of {t_left} left before you can issue that command again'
+                            '```'
+                            )
+            return 0
+        raise err
 
 
 def main():
-    logger = logging.getLogger('discord')
-    logger.setLevel(logging.INFO)
-
+    LOGGER.setLevel(logging.INFO)
     handler = logging.handlers.RotatingFileHandler(
         filename='discord.log',
         encoding='utf-8',
@@ -176,7 +320,7 @@ def main():
     formatter = logging.Formatter('[{asctime}] [{levelname:<8}] {name}: {message}', dt_fmt, style='{')
     handler.setFormatter(formatter)
     handler.setLevel(logging.INFO)
-    logger.addHandler(handler)
+    LOGGER.addHandler(handler)
 
     intents = discord.Intents.all()
     intents.message_content = True
